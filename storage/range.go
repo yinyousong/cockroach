@@ -1485,8 +1485,8 @@ func (r *Range) InternalTruncateLog(batch engine.Engine, ms *proto.MVCCStats, ar
 		reply.SetGoError(err)
 		return
 	}
-	start := engine.RaftLogKey(r.Desc().RaftID, args.Index).Next()
-	end := engine.RaftLogKey(r.Desc().RaftID, 0)
+	start := engine.RaftLogKey(r.Desc().RaftID, 0)
+	end := engine.RaftLogKey(r.Desc().RaftID, args.Index)
 	err = batch.Iterate(engine.MVCCEncodeKey(start), engine.MVCCEncodeKey(end),
 		func(kv proto.RawKeyValue) (bool, error) {
 			err := batch.Clear(kv.Key)
@@ -1907,6 +1907,8 @@ func (r *Range) ChangeReplicas(changeType proto.ReplicaChangeType, replica proto
 
 	// Validate the request and prepare the new descriptor.
 	desc := r.Desc()
+	log.Warningf("sourcelastindex")
+	r.loadLastIndex()
 	updatedDesc := *desc
 	updatedDesc.Replicas = append([]proto.Replica{}, desc.Replicas...)
 	found := -1       // tracks NodeID && StoreID

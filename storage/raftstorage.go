@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
 	gogoproto "github.com/gogo/protobuf/proto"
@@ -67,80 +68,74 @@ func (r *Range) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	return hs, cs, nil
 }
 
+func (r *Range) setLastIndex(eng engine.Engine, lastIndex uint64) error {
+	return engine.MVCCPut(eng, nil, engine.RaftLastIndexKey(r.Desc().RaftID),
+		proto.ZeroTimestamp, proto.Value{
+			Bytes: encoding.EncodeUint64(nil, lastIndex),
+		}, nil)
+}
+
 // loadLastIndex looks in the engine to find the last log index.
 func (r *Range) loadLastIndex() error {
-	logKey := engine.RaftLogPrefix(r.Desc().RaftID)
-	// The log keys are encoded in descending order, so the first log
-	// entry in the database is the last one that was written.
-	kvs, err := engine.MVCCScan(r.rm.Engine(),
-		logKey, logKey.PrefixEnd(),
-		1, proto.ZeroTimestamp, true, nil)
+	lastIndex := uint64(0)
+	raftID := r.Desc().RaftID
+	eng := r.rm.Engine()
+	v, err := engine.MVCCGet(eng, engine.RaftLastIndexKey(raftID),
+		proto.ZeroTimestamp, true, nil)
 	if err != nil {
 		return err
 	}
-	if len(kvs) > 0 {
-		// The log is non-empty, so use the most recent entry's index.
-		// The index is encoded in both the key and the value.
-		var lastEnt raftpb.Entry
-		err := gogoproto.Unmarshal(kvs[0].Value.Bytes, &lastEnt)
-		if err != nil {
-			return err
-		}
-		atomic.StoreUint64(&r.lastIndex, lastEnt.Index)
-	} else if len(kvs) == 0 {
+	if v != nil {
+		_, lastIndex = encoding.DecodeUint64(v.Bytes)
+	} else {
 		// The log is empty, which means we are either starting from scratch
 		// or the entire log has been truncated away. raftTruncatedState
 		// handles both cases.
-		ts, err := r.raftTruncatedState()
+		lastEnt, err := r.raftTruncatedState()
 		if err != nil {
 			return err
 		}
-		atomic.StoreUint64(&r.lastIndex, ts.Index)
+		lastIndex = lastEnt.Index
 	}
+	log.Warningf("lastindex=%d", lastIndex)
+	atomic.StoreUint64(&r.lastIndex, lastIndex)
 	return nil
 }
 
 // Entries implements the raft.Storage interface. Note that maxBytes is advisory
 // and this method will always return at least one entry even if it exceeds
-// maxBytes.
+// maxBytes. Passing maxBytes equal to zero disables size checking.
 // TODO(bdarnell): consider caching for recent entries, if rocksdb's builtin caching
 // is insufficient.
 func (r *Range) Entries(lo, hi, maxBytes uint64) ([]raftpb.Entry, error) {
-	// Scan over the log (which is stored backwards) to find the
-	// requested entries. Reversing [lo, hi) gives us (hi, lo]; since
-	// MVCCScan is inclusive in the other direction we must increment both the
-	// start and end keys.
-	kvs, err := engine.MVCCScan(r.rm.Engine(),
-		engine.RaftLogKey(r.Desc().RaftID, hi).Next(),
-		engine.RaftLogKey(r.Desc().RaftID, lo).Next(),
-		0, proto.ZeroTimestamp, true, nil)
+	// Scan over the log to find the requested entries in the range [lo, hi),
+	// stopping once we have enough.
+	var ents []raftpb.Entry
+	size := uint64(0)
+	var ent raftpb.Entry
+	scanFunc := func(kv proto.KeyValue) (bool, error) {
+		err := gogoproto.Unmarshal(kv.Value.GetBytes(), &ent)
+		if err != nil {
+			return false, err
+		}
+		size += uint64(ent.Size())
+		ents = append(ents, ent)
+		return maxBytes > 0 && size > maxBytes, nil
+	}
+
+	err := engine.MVCCIterate(r.rm.Engine(),
+		engine.RaftLogKey(r.Desc().RaftID, lo),
+		engine.RaftLogKey(r.Desc().RaftID, hi),
+		proto.ZeroTimestamp, true /* consistent */, nil /* txn */, scanFunc)
+
 	if err != nil {
 		return nil, err
 	}
-	ents := make([]raftpb.Entry, 0, len(kvs))
-	for _, kv := range kvs {
-		var ent raftpb.Entry
-		err = gogoproto.Unmarshal(kv.Value.GetBytes(), &ent)
-		if err != nil {
-			return nil, err
-		}
-		ents = append(ents, ent)
-	}
-	if len(ents) != int(hi-lo) {
-		return nil, raft.ErrUnavailable
-	}
-	// Reverse the log to get it back into the proper order.
-	for i, j := 0, len(ents)-1; i < j; i, j = i+1, j-1 {
-		ents[i], ents[j] = ents[j], ents[i]
-	}
 
-	// TODO(bdarnell): apply the limit earlier instead of after loading everything.
-	size := ents[0].Size()
-	for i := 1; i < len(ents); i++ {
-		size += ents[i].Size()
-		if uint64(size) > maxBytes {
-			return ents[:i], nil
-		}
+	// If neither the number of entries nor the size limitations had an
+	// effect, we weren't able to supply everything the client wanted.
+	if len(ents) != int(hi-lo) && (maxBytes == 0 || size < maxBytes) {
+		return nil, raft.ErrUnavailable
 	}
 
 	return ents, nil
@@ -233,9 +228,9 @@ func (r *Range) Snapshot() (raftpb.Snapshot, error) {
 		return raftpb.Snapshot{}, err
 	}
 	var desc proto.RangeDescriptor
-	// We ignore intents on the range descriptor (consistent=false) because we know
-	// they cannot be committed yet. (operations that modify range descriptors resolve their
-	// own intents when they commit).
+	// We ignore intents on the range descriptor (consistent=false) because we
+	// know they cannot be committed yet - operations that modify range
+	// descriptors resolve their own intents when they commit).
 	ok, err := engine.MVCCGetProto(snap, engine.RangeDescriptorKey(r.Desc().StartKey),
 		r.rm.Clock().Now(), false, nil, &desc)
 	if err != nil {
@@ -279,6 +274,9 @@ func (r *Range) Snapshot() (raftpb.Snapshot, error) {
 
 // Append implements the multiraft.WriteableGroupStorage interface.
 func (r *Range) Append(entries []raftpb.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
 	batch := r.rm.Engine().NewBatch()
 	for _, ent := range entries {
 		err := engine.MVCCPutProto(batch, nil, engine.RaftLogKey(r.Desc().RaftID, ent.Index),
@@ -287,17 +285,32 @@ func (r *Range) Append(entries []raftpb.Entry) error {
 			return err
 		}
 	}
-	// TODO(bdarnell): if the last entry's index < lastIndex, delete any remaining old entries.
-	err := batch.Commit()
-	if err != nil {
+	lastIndex := entries[len(entries)-1].Index
+	prevLastIndex := atomic.LoadUint64(&r.lastIndex)
+	// Delete any previously appended log entries which never committed.
+	for i := lastIndex + 1; i <= prevLastIndex; i++ {
+		err := engine.MVCCDelete(batch, nil,
+			engine.RaftLogKey(r.Desc().RaftID, i), proto.ZeroTimestamp, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := r.setLastIndex(batch, lastIndex); err != nil {
 		return err
 	}
-	atomic.StoreUint64(&r.lastIndex, entries[len(entries)-1].Index)
+
+	if err := batch.Commit(); err != nil {
+		return err
+	}
+	atomic.StoreUint64(&r.lastIndex, lastIndex)
 	return nil
 }
 
 // ApplySnapshot implements the multiraft.WriteableGroupStorage interface.
 func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
+	log.Warningf("lastindexbefore")
+	r.loadLastIndex()
 	snapData := proto.RaftSnapshotData{}
 	err := gogoproto.Unmarshal(snap.Data, &snapData)
 	if err != nil {
@@ -364,18 +377,16 @@ func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
 		return err
 	}
 
-	// Save the descriptor, applied index, lease and stats to our member variables.
+	// Save the descriptor and applied index to our member variables.
 	r.SetDesc(&desc)
 	atomic.StoreUint64(&r.appliedIndex, snap.Metadata.Index)
 	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
 	r.stats = stats
 
-	// TODO(bdarnell): extract the real last index.
-	// snap.Metadata.Index is the last applied index, but our snapshot may have given us
-	// some unapplied entries too. It's safe to set lastIndex too low (the entries will
-	// be re-sent), but it would be better to set this to the last entry in the log.
+	log.Warningf("metaindex=%d", snap.Metadata.Index)
 	atomic.StoreUint64(&r.lastIndex, snap.Metadata.Index)
-	return err
+	//return r.loadLastIndex()
+	return nil
 }
 
 // SetHardState implements the multiraft.WriteableGroupStorage interface.

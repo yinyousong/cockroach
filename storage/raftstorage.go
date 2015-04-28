@@ -75,7 +75,7 @@ func (r *Range) setLastIndex(eng engine.Engine, lastIndex uint64) error {
 		}, nil)
 }
 
-// loadLastIndex looks in the engine to find the last log index.
+// loadLastIndex atomically loads the last index from storage into the range.
 func (r *Range) loadLastIndex() error {
 	lastIndex := uint64(0)
 	raftID := r.Desc().RaftID
@@ -211,7 +211,41 @@ func loadAppliedIndex(eng engine.Engine, raftID int64) (uint64, error) {
 	if v != nil {
 		_, appliedIndex = encoding.DecodeUint64(v.Bytes)
 	}
+	log.Warningf("appliedindex=%d", appliedIndex)
 	return appliedIndex, nil
+}
+
+// loadAppliedIndex atomically updates the applied index from stable storage.
+func (r *Range) loadAppliedIndex() error {
+	appliedIndex, err := loadAppliedIndex(r.rm.Engine(), r.Desc().RaftID)
+	if err != nil {
+		return err
+	}
+	atomic.StoreUint64(&r.appliedIndex, appliedIndex)
+	return nil
+}
+
+// setAppliedIndex persists a new applied index and updates its cached
+// value in the range. If a non-nil engine is passed, it is used for the
+// write; otherwise the range's default engine is used. Commit() will
+// be called on the engine to keep the update as atomic as possible.
+func (r *Range) setAppliedIndex(appliedIndex uint64, eng engine.Engine) error {
+	if eng == nil {
+		eng = r.rm.Engine()
+	}
+	err := engine.MVCCPut(eng, nil, /* stats */
+		engine.RaftAppliedIndexKey(r.Desc().RaftID),
+		proto.ZeroTimestamp,
+		proto.Value{Bytes: encoding.EncodeUint64(nil, appliedIndex)},
+		nil /* txn */)
+	if err != nil {
+		return err
+	}
+	if err = eng.Commit(); err != nil {
+		return err
+	}
+	atomic.StoreUint64(&r.appliedIndex, appliedIndex)
+	return nil
 }
 
 // Snapshot implements the raft.Storage interface.
@@ -220,6 +254,8 @@ func (r *Range) Snapshot() (raftpb.Snapshot, error) {
 	snap := r.rm.NewSnapshot()
 	defer snap.Close()
 	var snapData proto.RaftSnapshotData
+	log.Warningf("snapshotting-index")
+	r.loadLastIndex()
 
 	// Read the range metadata from the snapshot instead of the members
 	// of the Range struct because they might be changed concurrently.
@@ -309,7 +345,7 @@ func (r *Range) Append(entries []raftpb.Entry) error {
 
 // ApplySnapshot implements the multiraft.WriteableGroupStorage interface.
 func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
-	log.Warningf("lastindexbefore")
+	log.Warningf("apply-snapshot")
 	r.loadLastIndex()
 	snapData := proto.RaftSnapshotData{}
 	err := gogoproto.Unmarshal(snap.Data, &snapData)
@@ -379,13 +415,13 @@ func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
 
 	// Save the descriptor and applied index to our member variables.
 	r.SetDesc(&desc)
-	atomic.StoreUint64(&r.appliedIndex, snap.Metadata.Index)
+	r.loadAppliedIndex()
 	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
 	r.stats = stats
 
 	log.Warningf("metaindex=%d", snap.Metadata.Index)
 	atomic.StoreUint64(&r.lastIndex, snap.Metadata.Index)
-	//return r.loadLastIndex()
+	return r.loadLastIndex()
 	return nil
 }
 
